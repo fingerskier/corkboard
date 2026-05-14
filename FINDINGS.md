@@ -1,49 +1,57 @@
-# Separate "channels":
-* Transcripts ~ actual back & forth with agents, rolling, not persisted
-* Audit trail ~ events, state changes, and metadata that is valuable to persist for query and replay
+# Spec review findings
 
+Reviewed `SPEC.md` for the agent orchestration bulletin-board design.
 
-# Event Types (kept small on purpose)
-─────────────────────────────────────────────────
-TASK_CREATED        task.id, source (cli|moderator|webhook), spec
-TASK_LINKED         from, to, kind (depends-on|blocks|spawned-from)
-TASK_STATUS         task.id, from, to, reason
-TASK_CANCELLED      task.id, by
+## Addressed in this pass
 
-DISPATCH            task.id, worker.profile, session.id, prompt-hash,
-                    git.sha, config-snapshot
-RESULT              task.id, session.id, outcome (ok|fail|blocked),
-                    files-touched[], tokens, duration, summary
+- Agent I/O is no longer hardwired into Claude Code internals.  `SPEC.md` now defines a narrow runtime adapter boundary, normalized input/output frames, adapter-owned transcripts, and Claude Code as the bundled default adapter.
+- Teleport is now implemented through the runtime adapter boundary, with
+  Claude Code as the v0.1 implementation. Future non-teleportable adapters
+  should be modeled as explicit adapter profiles, not optional methods.
+- Teleport unlock now uses an adapter-validated return handshake:
+  dashboard Resume emits `TELEPORT_UNLOCK_REQUESTED`; the adapter validates
+  exclusive return plus transcript `tip`/`transcriptHash`; only validated
+  `TELEPORT_UNLOCK` clears the lock, while `TELEPORT_UNLOCK_REJECTED` keeps it
+  locked.
+- Task creation now allows `workerProfile?`, which matters once multiple
+  adapters/profiles exist.
+- Audit payload field names now use implementation-friendly camelCase.
+- `README.md` now matches the thin single-command CLI described by the spec.
+- FS store recovery is now explicit: single-writer lock, fsynced appends,
+  rebuildable projections, partial trailing-line recovery, and hard failure
+  with repair instructions when `events.jsonl` is ambiguous.
+- The v0.1 adapter/storage capability question is closed: the MVP ships a
+  minimal `claude-code` adapter boundary and minimal FS Board contract. Session
+  fork, transcript pagination/export, public community adapter ABI, alternate
+  Board adapters, and `UNSUPPORTED_OPERATION` probing are explicitly out of
+  the v0.1 surface.
+- `toolPolicy` now has the minimal shape needed for a Claude Code SDK
+  coding/writing agent: `readRoots`, `writeRoots`, normalized tool grants,
+  shell command grants, network mode, and explicit Claude Code SDK escape
+  hatches.
+- Pause has been removed from the v0.1 task/session model. Handoff is now
+  specified as interrupt-then-lock, `/api/tasks/:id/pause` is gone, and locked
+  sessions are the only "do not dispatch here" state.
 
-PLAN_TICK           moderator.session.id, turn, decision, candidates[],
-                    chosen, rationale-hash
-REPLAN              moderator.session.id, reason, before-hash, after-hash
+## Explicitly out of scope (per product direction)
 
-SESSION_OPEN        session.id, kind (worker|moderator), cwd
-SESSION_FORK        from.id, to.id, by
-SESSION_CLOSE       session.id, reason (done|error|teleport)
+Corkboard is a local-only, single-user tool.
+The "server" is just the I/O interface, runs at user privilege, and inherits the operator's existing trust boundary.
+Security inside that boundary is the user's responsibility.
+The following review items are therefore declined rather than deferred:
+- Loopback auth / per-process tokens / origin checks.  Removed from `SPEC.md` §7.3; the API binds `127.0.0.1` and that is the contract.
+- Transcript redaction boundaries (previously medium item 5). Transcripts may contain secrets pasted or printed locally; corkboard does not scrub them.  Adapter-supplied hooks remain the user's escape hatch.
 
-TELEPORT_LOCK       session.id, task.id, by (operator), at
-TELEPORT_UNLOCK     session.id, returned-state, duration
+## Remaining issues
 
-HOOK_REJECT         worker.session.id, tool, args-hash, rule, reason
-SCOPE_VIOLATION     worker.session.id, attempted-path, allowed-root
+1. High: task mutation needs concurrency rules.
+   `SPEC.md:385` allows `PATCH /api/tasks/:id` to update status, prompt, and
+   scope. That is too broad once the moderator and dashboard both write to the
+   Board. Require `ifMatchEventId`/revision checks, and forbid prompt/scope
+   changes after dispatch except by creating a replacement task.
 
-VERIFY              task.id, kind (lint|test|typecheck), outcome, by
-
-COST                task.id, model, input-tokens, output-tokens, usd
-ERROR               source, kind, payload, recoverable
-
-That's roughly the whole vocabulary.
-Resist adding more.
-The discipline is: if an event doesn't enable a question someone will ask later, don't create it.
-
-
-# Storage
-- File-system by default: JSONL & MD
-- Adapterable ~ community can add DB adapters on demand
-
-
-# CLI
-- why `init`, `up`, `down`, `status`, `teleport`, `fork`, `resume`?  These are UI features
-- CLI is `npx corkboard --cwd . --storepath ./cb-store` etc.
+2. Low: adapter/plugin naming should be unified.
+   `SPEC.md:537` uses `corkboard-board-*`; `SPEC.md:627` uses
+   `corkboard-agent-*`. That distinction is clear, but discovery should use
+   one manifest shape so storage adapters, agent adapters, and hooks install
+   the same way.
