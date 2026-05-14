@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Bebe
 
 Bulletin-board style orchestration dashboard for AI agents.
@@ -10,3 +11,7 @@ live updates come over SSE, mutations over REST. The CLI is intentionally
 thin: `npx corkboard --cwd . --storepath ./cb-store`.
 
 See [SPEC.md](./SPEC.md) for the full design.
+=======
+# `corkboard`
+Bulletin-board style orchestration dashboard for AI agents
+>>>>>>> 3c175463e54790084fa46348f6c34766f8b557d4
