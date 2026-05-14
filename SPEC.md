@@ -38,7 +38,7 @@ Three observations drive the design:
 
 ## 3. Core concepts
 
-Four nouns. Everything else is implementation.
+Four nouns and two channels. Everything else is implementation.
 
 ### 3.1 Task
 A unit of work with a status, a scope (which repo / directory / domain), a
@@ -53,13 +53,31 @@ Workers do not see other workers' contexts.
 ### 3.3 Session
 The on-disk conversation log (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`) produced by any Claude Code invocation.
 Identified by a UUID.
-Sessions are first-class artifacts: stored on the Board, referenced by ID, resumable from either the SDK or the CLI.
+Sessions are first-class artifacts: referenced by ID on the Board, resumable from either the SDK or the CLI.
 
 ### 3.4 Board
 The bulletin board.
 The single source of truth for tasks, links, worker results, decisions, and session IDs.
 Pluggable backend (see §8).
 The moderator and dashboard both read/write through it.
+
+### 3.5 Channels
+
+Two distinct streams flow through the system. Conflating them is the
+fastest way to make corkboard incomprehensible.
+
+- **Transcripts.** The rolling back-and-forth between operator / moderator
+  / workers — model output, tool calls, intermediate reasoning. Streamed
+  live to the browser; **not persisted by corkboard**. The Claude Code
+  CLI already writes its own session JSONL under `~/.claude/projects/`;
+  corkboard does not duplicate it.
+- **Audit trail.** A small, fixed vocabulary of events and state
+  transitions (see §7.3 / §10.5). Append-only, queryable, replayable.
+  This is what gets stored, exported, and shipped to a Reqall adapter.
+
+The dashboard subscribes to both: log-cards tail the transcript channel;
+the task list, status header, and history view are driven by the audit
+channel.
 
 ---
 
@@ -68,7 +86,7 @@ The moderator and dashboard both read/write through it.
 ```
 ┌─────────────────────┐         ┌──────────────────────┐
 │   Browser (Svelte)  │ ◄──SSE──┤  Fastify (127.0.0.1) │
-│   log-cards         │ ──REST─►│  /api/* + /events    │
+│   log-cards / audit │ ──REST─►│  /api/* + /events    │
 └─────────────────────┘         └──────────┬───────────┘
                                            │ in-process
                                 ┌──────────▼───────────┐
@@ -77,14 +95,15 @@ The moderator and dashboard both read/write through it.
                                 └──────────┬───────────┘
                                            │
                                 ┌──────────▼───────────┐
-                                │  Board (pluggable)   │
-                                │  watch() → events    │
-                                └──────────┬───────────┘
-                                           │ spawn
+                                │  Board (pluggable)   │   ┌──────────────┐
+                                │  audit JSONL + MD    │──►│ ./cb-store/  │
+                                │  watch() → events    │   │ events.jsonl │
+                                └──────────┬───────────┘   │ tasks/*.md   │
+                                           │ spawn         └──────────────┘
                                   ┌────────▼────────┐
-                                  │  Workers        │
-                                  │  (claude -p)    │
-                                  └─────────────────┘
+                                  │  Workers        │  transcripts live
+                                  │  (claude -p)    │  in ~/.claude/projects
+                                  └─────────────────┘  (not duplicated)
 ```
 
 | Layer        | Component                       | Lifetime    |
@@ -92,48 +111,45 @@ The moderator and dashboard both read/write through it.
 | Trigger      | cron / webhook / manual         | per-tick    |
 | Brain        | moderator SDK loop              | long-lived  |
 | Hands        | workers (`claude -p` subprocs)  | per-task    |
-| State        | Board (pluggable)               | durable     |
+| Audit store  | Board (FS JSONL+MD by default)  | durable     |
+| Transcripts  | Claude Code session JSONLs      | durable (owned by CC) |
 | Service      | Fastify on `127.0.0.1` (REST+SSE) | long-lived |
 | View         | Browser dashboard (SvelteKit)   | on-demand   |
 | Intervention | `claude --resume <id>`          | on-demand   |
 
 The moderator never edits files. Workers never plan. The Board is the only
-shared truth. The Fastify service and moderator share one Node process —
-no internal IPC; the moderator subscribes to `Board.watch()` for dispatch
-and the SSE routes subscribe to the same emitter for browser fanout.
+shared truth for *audit*; transcripts are owned by Claude Code on disk
+and only tailed through it. The Fastify service and moderator share one
+Node process — no internal IPC; the moderator subscribes to
+`Board.watch()` for dispatch and the SSE routes subscribe to the same
+emitter for browser fanout.
 
 ---
 
 ## 5. CLI interface
 
-The CLI is deliberately thin: lifecycle and config only. All per-task
-interaction (create, list, inspect, cancel, link, resume) happens in the
-browser dashboard. Direct session intervention is done with the raw
-`claude --resume <session-id>` CLI (see §6).
+The CLI has no subcommands. Lifecycle (start/stop), task management,
+session intervention, and inspection are all UI surfaces — they live in
+the browser, in `claude --resume <id>`, or in a `SIGINT` on the running
+process. A subcommand layer would just be a worse rendering of those.
 
 ```
-npx corkboard <command> [options]
+npx corkboard --cwd <dir> --storepath <dir> [--port <n>]
 ```
 
-### 5.1 Commands
+| Flag             | Default                       | Purpose                                |
+|------------------|-------------------------------|----------------------------------------|
+| `--cwd <dir>`    | `process.cwd()`               | Root for moderator + default worker scope |
+| `--storepath <dir>` | `./cb-store`               | Where audit JSONL + MD records are written |
+| `--port <n>`     | `4321`                        | Fastify bind port on `127.0.0.1`       |
+| `--config <file>` | `<cwd>/corkboard.config.ts`  | Optional config file for worker profiles |
 
-| Command            | Purpose                                              |
-|--------------------|------------------------------------------------------|
-| `corkboard init`   | Scaffold `corkboard.config.ts` in cwd                |
-| `corkboard up`     | Start moderator + service; print dashboard URL       |
-| `corkboard down`   | Graceful shutdown; persist state                     |
-| `corkboard status` | One-shot snapshot of moderator + counts, exits 0     |
+Running it does one thing: bind the service, open the Board at
+`--storepath`, run the moderator loop, print the dashboard URL, and block
+until `SIGINT`. Everything else is a request on the API.
 
-`corkboard up` accepts `--port <n>` and `--storage <dir>` overrides; both
-otherwise come from env / config.
-
-### 5.2 Environment variables
-
-| Variable             | Default        | Purpose                          |
-|----------------------|----------------|----------------------------------|
-| `PORT`               | `4321`         | Fastify bind port (127.0.0.1)    |
-| `STORAGE_DIR`        | `./.corkboard` | Board DB + audit log location    |
-| `CORKBOARD_CONFIG`   | `./corkboard.config.ts` | Path to config file     |
+The same invocation is the only entrypoint; `npx corkboard --help` prints
+flags and exits.
 
 ---
 
@@ -212,8 +228,12 @@ Without these, the SDK resumes with a minimal prompt and CLAUDE.md is ignored �
 
 ### 6.5 Hard rules
 
-- A teleported session is **locked** to the CLI for its duration.
-- The moderator detects locks via a Board flag, not by polling the JSONL.
+- A teleported session is **locked** to the CLI for its duration. Entering
+  teleport emits `TELEPORT_LOCK { session.id, task.id, by, at }`; exiting
+  (via dashboard **Resume**) emits `TELEPORT_UNLOCK { session.id,
+  returned-state, duration }`. Both go on the audit channel (§7.3).
+- The moderator detects locks via the Board (driven by those events), not
+  by polling the JSONL.
 - Cross-host teleport requires syncing the session file; v1 is single-host.
 
 ---
@@ -242,14 +262,14 @@ Single page, two regions:
 ```
 
 - **Left rail.** Task list from `GET /api/tasks`, live-updated by
-  `task.created` / `task.updated` events on `/api/events`. Click a task to
+  `TASK_CREATED` / `TASK_STATUS` events on `/api/events`. Click a task to
   open or focus its log-card.
 - **Log-cards.** One per active or pinned task. Each card subscribes to
   `GET /api/tasks/:id/stream` (SSE) for worker stdout. Card controls call
   REST (`/cancel`, `/resume`, etc.); the "Open in CLI" control surfaces
   the `claude --resume <id>` command to copy-paste.
 - **Header.** Moderator status (running/paused/replanning) + counts, fed
-  by `GET /api/status` and `moderator.replan` events.
+  by `GET /api/status` and `REPLAN` / `PLAN_TICK` events.
 
 ### 7.2 Read-only export
 
@@ -281,35 +301,87 @@ streams. JSON in/out. No auth — loopback-only bind is the boundary.
 
 #### SSE
 
-| Path                          | Stream                                                  |
-|-------------------------------|---------------------------------------------------------|
-| `GET /api/events`             | Board-wide events: task created / updated / linked, worker started / finished, moderator replan. |
-| `GET /api/tasks/:id/stream`   | Tail of worker stdout/stderr + structured SDK messages for one task. Closes on worker exit. |
+Two streams, one per channel (see §3.5):
 
-Event shape:
+| Path                          | Channel    | Stream                                                  |
+|-------------------------------|------------|---------------------------------------------------------|
+| `GET /api/events`             | Audit      | All audit events (vocabulary below). Used to drive task list, status header, history view. |
+| `GET /api/tasks/:id/stream`   | Transcript | Live tail of worker stdout/stderr + structured SDK messages for one task. Not persisted by corkboard. Closes on worker exit. |
 
-```ts
-type BoardEvent =
-  | { type: 'task.created' | 'task.updated', task: Task }
-  | { type: 'task.linked', from: Id, to: Id, kind: LinkKind }
-  | { type: 'worker.started' | 'worker.done', taskId: Id, result?: WorkerResult }
-  | { type: 'worker.stdout', taskId: Id, line: string }
-  | { type: 'moderator.replan', plan: PlanSnapshot }
-```
+Reconnect on `/api/events`: clients send `Last-Event-ID` and the server
+replays from the audit log (§10.5), which **is** the persistent store —
+the audit JSONL doubles as the replay buffer. `/api/tasks/:id/stream`
+does not replay; reconnects only pick up live output.
 
-Reconnect: clients send `Last-Event-ID` and the server replays from the
-audit log (§10.5), which doubles as the replay buffer.
+#### Audit event vocabulary
+
+Fixed, deliberately small. Adding events requires a real question to
+answer; if no one will ask it later, don't ship it.
+
+| Event              | Payload                                                              |
+|--------------------|----------------------------------------------------------------------|
+| `TASK_CREATED`     | `task.id`, `source` (`cli\|moderator\|webhook`), `spec`              |
+| `TASK_LINKED`      | `from`, `to`, `kind` (`depends-on\|blocks\|spawned-from`)            |
+| `TASK_STATUS`      | `task.id`, `from`, `to`, `reason`                                    |
+| `TASK_CANCELLED`   | `task.id`, `by`                                                      |
+| `DISPATCH`         | `task.id`, `worker.profile`, `session.id`, `prompt-hash`, `git.sha`, `config-snapshot` |
+| `RESULT`           | `task.id`, `session.id`, `outcome` (`ok\|fail\|blocked`), `files-touched[]`, `tokens`, `duration`, `summary` |
+| `PLAN_TICK`        | `moderator.session.id`, `turn`, `decision`, `candidates[]`, `chosen`, `rationale-hash` |
+| `REPLAN`           | `moderator.session.id`, `reason`, `before-hash`, `after-hash`        |
+| `SESSION_OPEN`     | `session.id`, `kind` (`worker\|moderator`), `cwd`                    |
+| `SESSION_FORK`     | `from.id`, `to.id`, `by`                                             |
+| `SESSION_CLOSE`    | `session.id`, `reason` (`done\|error\|teleport`)                     |
+| `TELEPORT_LOCK`    | `session.id`, `task.id`, `by` (operator), `at`                       |
+| `TELEPORT_UNLOCK`  | `session.id`, `returned-state`, `duration`                           |
+| `HOOK_REJECT`      | `worker.session.id`, `tool`, `args-hash`, `rule`, `reason`           |
+| `SCOPE_VIOLATION`  | `worker.session.id`, `attempted-path`, `allowed-root`                |
+| `VERIFY`           | `task.id`, `kind` (`lint\|test\|typecheck`), `outcome`, `by`         |
+| `COST`             | `task.id`, `model`, `input-tokens`, `output-tokens`, `usd`           |
+| `ERROR`            | `source`, `kind`, `payload`, `recoverable`                           |
+
+Each event on the wire is `{ id, ts, type, ...payload }`. `id` is a
+monotonic sequence used for `Last-Event-ID` resume.
 
 ---
 
 ## 8. Storage backend
 
-Pluggable. Ship two adapters out of the box:
+The Board stores **audit data only** (events + task records). Transcripts
+are not persisted by corkboard — they live in Claude Code's session
+JSONLs under `~/.claude/projects/` and are read through that path when
+needed.
 
-| Adapter   | Use case                                | Config                   |
+Pluggable. Default ships filesystem-only; databases are community
+adapters added on demand.
+
+| Adapter   | Use case                                | Notes                    |
 |-----------|-----------------------------------------|--------------------------|
-| `sqlite`  | Default. Zero-config local file.        | `./corkboard.db`         |
-| `reqall`  | Cross-project / shared memory.          | OAuth or token           |
+| `fs`      | **Default.** Zero-config, human-readable, greppable. | `--storepath ./cb-store/` |
+| `reqall`  | Cross-project / shared memory.          | Community adapter (v0.3) |
+| `sqlite`  | Single-file DB for higher event rates.  | Community adapter        |
+
+### 8.1 FS layout (default)
+
+Everything under `--storepath` (default `./cb-store`):
+
+```
+cb-store/
+├── events.jsonl            # append-only audit channel; one event per line
+├── events.idx              # sparse index: byte offsets by event id
+├── tasks/
+│   ├── 1729.md             # one MD file per task; frontmatter + body
+│   └── 1731.md
+├── sessions/
+│   └── 7e3a1f0c-....json   # session metadata (id, cwd, kind, locks)
+└── config.snapshot.json    # captured at startup, referenced by DISPATCH
+```
+
+`events.jsonl` is the source of truth; the `tasks/` and `sessions/` files
+are materialized projections rebuildable by replaying events from
+position 0. The dashboard reads projections; the SSE replay reads the
+JSONL directly.
+
+### 8.2 Adapter interface
 
 A backend is a class implementing `Board`:
 
@@ -317,27 +389,30 @@ A backend is a class implementing `Board`:
 interface Board {
   task: { create, get, list, update, link, search }
   session: { register, get, lock, unlock, list }
-  result: { append, list }
-  watch(callback): Unsubscribe   // realtime push to dashboard
+  events: { append(event), readFrom(id), watch(cb): Unsubscribe }
 }
 ```
 
 Anyone can publish `@scope/corkboard-adapter-foo` and wire it in via
-config. Postgres, S3-backed JSON, Notion, Linear — all plausible.
+config. Postgres, SQLite, S3-backed JSON, Notion, Linear — all plausible.
 
 ---
 
 ## 9. Configuration
 
-`corkboard.config.ts` in the project root:
+Config is optional. With no config file present, corkboard runs with FS
+storage at `--storepath`, a single default worker profile (the current
+`--cwd` with a conservative tool allowlist), and the default moderator
+settings. A `corkboard.config.ts` is only needed to define multiple
+worker profiles, swap the Board adapter, or tune the moderator.
 
 ```ts
 import { defineConfig } from 'corkboard'
 
 export default defineConfig({
   board: {
-    adapter: 'sqlite',
-    path: './corkboard.db',
+    adapter: 'fs',           // default; community adapters: 'reqall', 'sqlite', ...
+    // path is overridden by --storepath
   },
 
   workers: {
@@ -363,13 +438,12 @@ export default defineConfig({
     replanEvery: 5,        // re-evaluate plan every 5 worker completions
     sessionPersist: true,  // moderator's own session survives restart
   },
-
-  dashboard: {
-    tui: true,
-    web: { enabled: true, port: 4321 },
-  },
 })
 ```
+
+Port and store path are CLI flags only (`--port`, `--storepath`); they
+are not in the config file so that the same config can be used across
+machines with different paths.
 
 ---
 
@@ -401,9 +475,11 @@ dispatch and posts a notice to the Board.
 ### 10.5 Audit log
 
 Every dispatch, every result, every teleport is appended to an
-append-only event log. The log doubles as the SSE replay buffer (§7.3),
-and `GET /api/export?format=md` includes the full audit trail. Cheap
-insurance.
+append-only event log — `events.jsonl` in the FS adapter, using the
+vocabulary in §7.3 (`TASK_CREATED`, `DISPATCH`, `RESULT`, `REPLAN`,
+`TELEPORT_LOCK`, `HOOK_REJECT`, ...). The log is the persistent record
+*and* the SSE replay buffer (§7.3); `GET /api/export?format=md` renders
+it as a human-readable transcript of decisions. Cheap insurance.
 
 ---
 
@@ -411,17 +487,18 @@ insurance.
 
 The smallest thing that's honest:
 
-- [ ] `corkboard init` / `up` / `down` / `status`
-- [ ] SQLite Board adapter
+- [ ] `npx corkboard --cwd . --storepath ./cb-store [--port N]` single invocation
+- [ ] FS Board adapter: `events.jsonl` + `tasks/*.md` + `sessions/*.json`
 - [ ] Single-worker dispatch (serial, no parallelism)
 - [ ] Moderator SDK loop: plan → dispatch one task → ingest result → repeat
+- [ ] Audit vocabulary (§7.3) emitted at every meaningful state change
 - [ ] Fastify service on `127.0.0.1`: REST endpoints from §7.3
-- [ ] SSE: `/api/events` + `/api/tasks/:id/stream`
+- [ ] SSE: `/api/events` (audit, with `Last-Event-ID` replay from JSONL) + `/api/tasks/:id/stream` (live transcript)
 - [ ] Browser dashboard (SvelteKit, static, served by Fastify): task list + log-cards
-- [ ] Worker → CLI teleport via copy-paste `claude --resume <id>` from the log-card
-- [ ] Scope-enforcement PreToolUse hook
+- [ ] Worker → CLI teleport via copy-paste `claude --resume <id>` from the log-card; emits `TELEPORT_LOCK` / `TELEPORT_UNLOCK`
+- [ ] Scope-enforcement PreToolUse hook (emits `SCOPE_VIOLATION` / `HOOK_REJECT`)
 
-Explicit non-goals for v0.1: parallel workers, Reqall adapter,
+Explicit non-goals for v0.1: parallel workers, Reqall / SQLite adapters,
 verification workers, cross-host teleport, in-browser xterm/PTY, auth.
 All layer cleanly on top once the core loop is solid.
 
